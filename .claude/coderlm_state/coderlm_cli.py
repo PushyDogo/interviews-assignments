@@ -1,0 +1,1 @@
+/Users/manu.gupta/.claude/plugins/cache/coderlm/coderlm/0.1.5/skills/coderlm/scripts/coderlm_cli.py
