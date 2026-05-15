@@ -171,46 +171,16 @@ Stage 5 uses the same tenant schema registry introduced in Stage 4. The merge po
 
 Each schema must define how fields merge. This keeps merge behavior explicit and testable.
 
-Recommended merge policy shape:
+Each field entry in the merge policy declares its cardinality, criticality, merge strategy, and minimum coverage. For example:
 
 ```json
 {
-  "merge_policy_version": "2026-05-15.v1",
-  "schema_id": "invoice_v1",
-  "field_rules": {
-    "invoice_number": {
-      "cardinality": "singleton",
-      "criticality": "critical",
-      "merge_strategy": "highest_confidence_with_conflict_check",
-      "conflict_policy": "manual_inspection_on_distinct_high_confidence_values",
-      "minimum_coverage": "required"
-    },
-    "line_items": {
-      "cardinality": "array",
-      "criticality": "critical",
-      "merge_strategy": "append_dedupe_preserve_order",
-      "dedupe_keys": ["description", "quantity", "unit_price", "amount"],
-      "minimum_coverage": "required_if_present"
-    },
-    "governing_law": {
-      "cardinality": "singleton",
-      "criticality": "normal",
-      "merge_strategy": "document_synthesis_if_conflicting",
-      "minimum_coverage": "optional"
-    },
-    "document_summary": {
-      "cardinality": "singleton",
-      "criticality": "normal",
-      "merge_strategy": "document_synthesis_required",
-      "minimum_coverage": "optional",
-      "summary_required": false
-    }
-  },
-  "document_success_thresholds": {
-    "critical_field_coverage": 1.0,
-    "required_field_coverage": 0.95,
-    "max_unresolved_critical_conflicts": 0,
-    "max_unresolved_normal_conflicts": 3
+  "invoice_number": {
+    "cardinality": "singleton",
+    "criticality": "critical",
+    "merge_strategy": "highest_confidence_with_conflict_check",
+    "conflict_policy": "manual_inspection_on_distinct_high_confidence_values",
+    "minimum_coverage": "required"
   }
 }
 ```
@@ -245,16 +215,7 @@ For every field, the merge worker:
 7. Computes merged confidence and citation coverage.
 8. Records merge decisions and conflicts.
 
-Normalization examples:
-
-| Field type | Normalization |
-|---|---|
-| Date | Parse to ISO-8601 where unambiguous; keep original text as `raw_value` |
-| Currency amount | Normalize currency code, decimal separator, and sign |
-| Identifier | Trim whitespace, normalize punctuation, preserve original text |
-| Party name | Case-fold for comparison, preserve original casing from best citation |
-| Address | Normalize line breaks and whitespace; do not over-aggressively rewrite |
-| Clause text | Normalize whitespace only; preserve source-backed wording |
+Normalization is field-type-specific: dates parse to ISO-8601, amounts normalize currency code and decimal separator, identifiers trim whitespace, text fields normalize whitespace only while preserving source-backed wording. Original values are always kept as `raw_value` alongside the normalized form.
 
 Deterministic merge must not invent values. If every candidate is `not_found`, the merged field remains `not_found`.
 
@@ -274,16 +235,7 @@ Conflict classes:
 | Cross-chunk dependency | Contract obligation depends on definition in another section | Bounded synthesis |
 | Unsupported critical source | Field depends on unsupported page | Manual inspection |
 
-Default conflict thresholds:
-
-| Signal | Critical field | Non-critical field |
-|---|---:|---:|
-| Candidate confidence floor | `0.90` | `0.75` |
-| Distinct value conflict threshold | `>= 2` high-confidence distinct values | `>= 2` high-confidence distinct values |
-| Citation coverage required | `100%` for non-null values | `100%` for non-null values |
-| Manual inspection on unresolved conflict | Yes | Only if schema says required or conflict count exceeds threshold |
-
-When a critical singleton field has multiple distinct high-confidence values and the schema does not define a deterministic override rule, Stage 5 must route the field to `MERGE_MANUAL_INSPECTION_REQUIRED`. A model should not be used to guess a critical value unless the schema explicitly allows synthesis and the output remains citation-gated.
+V1 defaults: candidate confidence floor is `0.90` for critical fields and `0.75` for non-critical; citation coverage is required for all non-null values. When a critical singleton field has multiple distinct high-confidence values and the schema does not define a deterministic override rule, Stage 5 must route the field to `MERGE_MANUAL_INSPECTION_REQUIRED`. A model should not be used to guess a critical value unless the schema explicitly allows synthesis and the output remains citation-gated.
 
 ### 5.5 Partial Success and Field Coverage
 
@@ -325,34 +277,7 @@ Stage 5 uses synthesis only when one of these is true:
 
 Document-level summaries are doc-type and schema specific. They are emitted only when the schema declares `summary_required: true` and the projected synthesis cost stays within the Stage 5 cost budget. If summaries push the job above the hard Stage 5 stop-loss or materially threaten the overall `$0.10/100-page` representative target, the v1 system should skip automated summary generation, mark the summary field as `not_found` with `rejection_reason="COST_POLICY_DEFERRED"`, and call out self-hosted inference as the v2 path to bring summary economics under the cost barrier.
 
-Minimal v1 summary schema, subject to domain-expert validation:
-
-```json
-{
-  "document_summary": {
-    "status": "generated | not_found | cost_deferred | manual_review_required",
-    "summary_text": "Short source-backed summary, recommended <= 150 words.",
-    "key_points": [
-      {
-        "text": "Source-backed key point.",
-        "source_citations": []
-      }
-    ],
-    "risks_or_open_items": [
-      {
-        "text": "Source-backed risk, ambiguity, or missing information.",
-        "severity": "low | medium | high",
-        "source_citations": []
-      }
-    ],
-    "source_citations": [],
-    "confidence": 0.0,
-    "rejection_reason": null
-  }
-}
-```
-
-For contracts, `key_points` should initially cover parties, effective date, term/renewal, obligations, governing law, and signatures when present. For corporate reports, `key_points` should initially cover reporting period, entities, key metrics, risks, and notable changes when present. Domain experts should validate this schema before production launch.
+The `document_summary` output field carries a status (`generated`, `not_found`, `cost_deferred`, `manual_review_required`), source-backed summary text, key points, risks/open items, and citations. The specific schema for each document type must be validated with domain experts before production launch.
 
 The synthesis pass must stay bounded:
 
@@ -364,15 +289,7 @@ The synthesis pass must stay bounded:
 - Require every non-null synthesized value to carry citations back to Stage 4 candidates and Stage 3 source spans.
 - Reject uncited synthesized values as `not_found`.
 
-Recommended synthesis token budgets:
-
-| Budget | Limit |
-|---|---:|
-| Target input tokens | `<= 20K` |
-| Hard input cap | `30K` |
-| Target output tokens | `<= 1.5K` |
-| Hard output cap | `2K` |
-| Maximum synthesis questions per document | `10` |
+Synthesis token budget: ≤20K target input, 30K hard cap, ≤1.5K target output, 2K hard cap, maximum 10 synthesis questions per document.
 
 The cap of `10` synthesis questions is a v1 guardrail to bound model calls, token cost, review complexity, and tail latency. It should cover the minimal contract/report summary schema plus a small number of cross-chunk fields. If more than `10` synthesis questions are required, Stage 5 should process the highest-priority questions by schema criticality and route overflow questions to manual inspection or degraded review with `rejection_reason="SYNTHESIS_QUESTION_LIMIT_EXCEEDED"`. If the synthesis packet exceeds the hard cap, Stage 5 should split synthesis by field group. If a single field group still exceeds the cap, route that field to manual inspection rather than silently truncating citations.
 
@@ -628,6 +545,10 @@ Recommended metrics:
 
 High-cardinality tenant/job/chunk IDs should stay in structured logs and X-Ray traces, not as unconstrained metric dimensions.
 
+### 11.1 Alerts
+
+Alert on: merge latency SLO burn, queue age spikes, DLQ depth growth, critical field conflict rate increases, critical field coverage drops, synthesis cost spikes, synthesis validation failures, manual-inspection rate increases, KMS access failures, and PII detected in logs.
+
 Useful traces:
 
 - `Stage5.MergeCoordinator`
@@ -650,7 +571,6 @@ Required versioning:
 - Synthesis model ID and route.
 - Citation resolver version.
 - Field normalization library version.
-- Evaluation dataset version.
 
 Evaluation requirements:
 
@@ -672,20 +592,3 @@ Canary guardrails:
 - No increase in manual-inspection rate unless it catches known bad outputs.
 - P95 merge latency remains within `30s`.
 
-## 13. Closed Stage 5 Decisions
-
-| Decision | V1 choice | V2 refinement |
-|---|---|---|
-| Merge default | Deterministic schema-driven merge first | Learn schema-specific merge policies from reviewed documents |
-| Document-level synthesis | Bounded and field-targeted only when required; document summaries only when cost budget allows | More advanced retrieval and self-hosted inference for summary-heavy workflows |
-| Synthesis question cap | Maximum `10` synthesis questions per document; overflow routes to manual inspection/degraded review | Schema/tier-specific question budgets |
-| Synthesis model | Same Bedrock Llama 3.1 8B default; 70B only for critical recovery when allowed | Tenant/tier-specific synthesis model routing |
-| Field citations | Required for every non-null merged or synthesized value | Customer-configurable citation display formats |
-| Citation replay stability | Validate citations against current chunk artifact hashes; re-merge after artifact replacement | Reviewer-assisted citation repair |
-| Partial success | Based on critical/required/optional field coverage and page criticality; degraded outputs require manual evaluation before delivery | Tenant-specific thresholds in tiered plans |
-| Degraded review queue | Separate queue from critical manual inspection | Workflow-specific review queues and SLAs |
-| Minimal summary schema | `document_summary` with summary text, key points, risks/open items, citations, confidence, and rejection reason | Domain-specific summary schemas |
-| Manual-review handoff | Stage 5 can produce interim result from terminal-or-resumable chunks; `manual_review.completed` triggers re-merge | Richer reviewer workflows and partial approvals |
-| Audit events | Explicit PII-free merge, synthesis, degraded, manual-review, poison, and re-merge event set | Additional reviewer productivity events |
-| Stage 5 latency budget | P50 `<= 5s`, P95 `<= 30s`, P99 `<= 60s` | Tune from production by document type |
-| Stage 5 cost target | Deterministic merge `<= $0.001/100 pages`; synthesis target `<= $0.010/100 pages`; skip summaries when hard stop-loss would be breached | Self-hosted inference for summary-heavy workloads to stay under cost barrier |
