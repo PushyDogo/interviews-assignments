@@ -254,19 +254,7 @@ Webhook security:
 - Rotate webhook secrets with overlap.
 - Store delivery attempts without payload PII.
 
-Webhook delivery:
-
-| Rule | V1 value |
-|---|---:|
-| Initial dispatch target | `<= 5s` after terminal state is durable |
-| Max delivery attempts | `8` |
-| Retry policy | Exponential backoff with jitter |
-| Max retry window | `24h` |
-| Timeout per attempt | `5s` connect/read budget |
-| Success status codes | `2xx` |
-| Permanent failure | `410 Gone`, disabled endpoint, or tenant-deleted webhook |
-
-Webhook failure does not change the completed job result. It changes only webhook delivery state.
+V1 delivery policy: 8 attempts maximum over a 24-hour window, exponential backoff with jitter, 5-second connect/read timeout per attempt. `2xx` is success; `410 Gone` or a disabled endpoint permanently fails delivery. Webhook failure does not change the completed job result — it changes only webhook delivery state.
 
 ### 5.6 Retention and Lifecycle
 
@@ -351,17 +339,7 @@ Recommended ledger fields:
 - `billable`
 - `billing_reason`
 
-Approximate v1 cost policy:
-
-| Cost item | Target |
-|---|---:|
-| Output artifact storage/write | `<= $0.001 / 100 pages` |
-| Retrieval/index updates | `<= $0.0005 / job` |
-| Webhook dispatch | `<= $0.0005 / job` |
-| Stage 7 soft stop-loss | `> $0.003 / job` |
-| Stage 7 hard stop-loss | `> $0.005 / job` |
-
-Storage cost continues over retention lifetime. Cost dashboards should show both processing cost and retained-storage cost.
+Stage 7 cost is storage, S3/DynamoDB requests, and webhook Lambda — total well under `$0.005/job`. Storage cost accumulates over the retention lifetime; cost dashboards must show both per-job processing cost and retained-storage cost separately.
 
 ## 8. Idempotency and Replay
 
@@ -473,6 +451,10 @@ Useful traces:
 
 High-cardinality tenant/job IDs should stay in structured logs and traces, not unconstrained metric dimensions.
 
+### 11.1 Alerts
+
+Alert on: Stage 7 latency SLO burn, output promotion failure spikes, retrieval index write failures, webhook retry exhaustion rate increases, DLQ depth growth, GDPR deletion stuck or legal-hold blocked, output hash mismatch events, KMS access failures, and retrieval API elevated 4xx/5xx.
+
 ## 12. MLOps and Operations
 
 Stage 7 has no model behavior, but it is critical for customer experience and compliance.
@@ -485,17 +467,6 @@ Required versioning:
 - Retention policy version.
 - Deletion workflow version.
 
-Operational runbooks:
-
-- S3 output promotion failures.
-- KMS/IAM access denied.
-- Retrieval API elevated 4xx/5xx.
-- Webhook endpoint outage.
-- Webhook retry exhaustion.
-- Stage 7 DLQ growth.
-- GDPR deletion stuck or legal-hold blocked.
-- Output hash mismatch or manifest conflict.
-
 Canary guardrails:
 
 - No increase in terminal-state write failures.
@@ -505,17 +476,3 @@ Canary guardrails:
 - P95 Stage 7 latency remains within `10s`.
 - No customer-facing access to support-only artifacts.
 
-## 13. Closed Stage 7 Decisions
-
-| Decision | V1 choice | V2 refinement |
-|---|---|---|
-| Handoff | Step Functions transition plus EventBridge/SQS handoff from Stage 6 | Separate storage and notification workflows if scale requires |
-| Output storage | Promote Stage 6 JSON artifacts to tenant-scoped S3 output bucket | Multi-region output replication if needed |
-| Customer retrieval | Always return API metadata plus short-lived signed URL for `customer-result.json`; no inline result body in v1 | Customer-selectable delivery modes |
-| Webhook payload | Pointer-only signed event, no extracted values or presigned S3 URL | Optional small inline summaries if explicitly allowed |
-| Webhook endpoint model | Pre-registered `webhook_id` only | Per-job callbacks after allowlisting/domain verification |
-| Webhook retry | 8 attempts over 24h with jitter | Tenant-specific delivery policies |
-| Terminal webhooks | Emit for success and non-success terminal states | Tenant-specific event subscriptions |
-| Retention | Default 365 days for input/final output; move original inputs to cold storage after 7 days; short-lived intermediates; PII-free immutable audit | Tenant-specific retention policies |
-| Customer artifacts | `customer-result.json` only in customer APIs | Governed access/export for validation report |
-| Stage 7 latency budget | P50 `<= 2s`, P95 `<= 10s`, P99 `<= 20s` | Tune from output size and webhook volume |

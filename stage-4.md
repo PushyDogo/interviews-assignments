@@ -550,20 +550,207 @@ Canary guardrails:
 
 ## 14. Self-Hosted Inference Option
 
-The case study requires explaining a self-hosted LLM option. V1 should be managed-first, but the architecture should preserve the option.
+V1 uses Bedrock managed inference. This section describes the self-hosted path the platform must be capable of adopting and the quantitative analysis required to decide when to switch.
 
-Self-hosted path:
+### 14.1 GPU Infrastructure Design
 
-- EKS for inference services.
-- Karpenter for GPU node provisioning.
-- KEDA scales inference deployments from queue depth, token backlog, or custom metrics.
-- vLLM or TGI serves the Llama 3.1 Instruct model family.
-- Prometheus/Grafana tracks GPU utilization, GPU memory, queue depth, batch size, tokens/sec, TTFT, model latency, error rate, pod restarts, node provisioning time, and cost per GPU hour.
+**Instance selection**
 
-Use self-hosted inference only after:
+Llama 3.1 8B in FP16 requires ~16 GB VRAM. The NVIDIA A10G (24 GB VRAM) is the right fit for the 8B default model. The recommended instance type is `g5.xlarge` (1× A10G), which balances VRAM, throughput, and cost. The 8B model should use INT8 or FP8 quantization via vLLM to increase per-GPU throughput above the break-even threshold (see Section 14.3).
 
-- Model quality is comparable for the target schemas.
-- Utilization is high enough to beat Bedrock cost per token.
-- Tenant isolation, data residency, and security controls are validated.
-- Rollback to managed Bedrock is tested.
+Llama 3.1 70B in FP16 requires ~140 GB VRAM and needs multi-GPU. With INT4 quantization (~35 GB), it fits on `g5.12xlarge` (4× A10G, 96 GB). However, as Section 14.3 shows, 70B self-hosted cost per token is unlikely to beat Bedrock's `$0.72/1M` rate at platform scale. The 70B recovery path should remain on Bedrock unless utilization analysis at scale proves otherwise.
+
+**Node pool architecture: reserved baseline + spot/on-demand scaling**
+
+The platform uses a three-tier GPU node model:
+
+| Tier | Instance | Pricing | Purpose |
+|---|---|---|---|
+| Reserved baseline | 2× `g5.xlarge`, 1-year no-upfront reserved | ~`$0.523/hr` effective | Always-on capacity for steady-state throughput; minimum HA across AZs |
+| Spot burst | `g5.xlarge` via Karpenter | ~`$0.35/hr` | Cost-optimized burst; handles 80%+ of variable load above baseline |
+| On-demand overflow | `g5.xlarge` or `g5.2xlarge` via Karpenter | `$1.006/hr` | Fallback when spot capacity is unavailable; latency-sensitive recovery path |
+
+Reserved instances cover the predictable 10K docs/day baseline. Spot instances handle burst above baseline at ~65% cost reduction from on-demand. On-demand overflow ensures the platform never hard-fails during spot scarcity.
+
+**Karpenter NodePool**
+
+```yaml
+spec:
+  requirements:
+    - key: karpenter.sh/capacity-type
+      operator: In
+      values: ["spot", "on-demand"]
+    - key: node.kubernetes.io/instance-type
+      operator: In
+      values: ["g5.xlarge", "g5.2xlarge"]
+    - key: karpenter.k8s.aws/instance-gpu-name
+      operator: In
+      values: ["a10g"]
+  limits:
+    nvidia.com/gpu: 20
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+```
+
+The `nvidia.com/gpu: 20` cap is a cost guardrail — 20 A10G GPUs at spot rates is the maximum burst spend allowed by default. Karpenter drains idle GPU nodes after 5 minutes empty to avoid idle reservation charges.
+
+**KEDA ScaledObject for vLLM deployment**
+
+KEDA scales the vLLM inference deployment from two signals:
+
+- **Primary:** SQS extraction job queue depth — each message represents one chunk awaiting model inference.
+- **Secondary:** vLLM `vllm:num_requests_waiting` Prometheus metric — requests queued inside the model server's KV-cache scheduler, indicating memory pressure beyond queue depth.
+
+```yaml
+triggers:
+  - type: aws-sqs-queue
+    metadata:
+      queueURL: https://sqs.us-east-1.amazonaws.com/.../extraction-jobs
+      queueLength: "5"        # scale up when queue depth per replica > 5
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus:9090
+      metricName: vllm_requests_waiting
+      threshold: "10"         # scale up when >10 requests waiting inside vLLM
+```
+
+Min replicas: 1 (keep one pod warm to avoid cold-start latency). Max replicas: bounded by Karpenter GPU limit. Scale-down cooldown: 5 minutes to avoid flapping under bursty workloads.
+
+**Graceful handling of spot interruptions**
+
+vLLM receives a 2-minute warning before AWS reclaims a spot instance. The platform must:
+
+1. Stop routing new requests to the draining pod (controlled by Kubernetes `terminationGracePeriodSeconds` and pod readiness gates).
+2. Allow in-flight inference requests to complete or time out.
+3. Requeue unacknowledged SQS messages (SQS visibility timeout ensures they become visible again automatically).
+4. Emit a `GPU_NODE_INTERRUPTED` metric event for observability.
+
+Idempotency in Stage 4 (Section 9) ensures requeued messages produce the same result without duplicate model billing.
+
+### 14.2 Self-Hosted Model Observability
+
+All self-hosted inference metrics are collected by Prometheus and visualized in Grafana. They must be comparable to Bedrock managed-model metrics so the platform can evaluate both paths against the same SLOs.
+
+**GPU and infrastructure metrics (node-level)**
+
+| Metric | Source | Purpose |
+|---|---|---|
+| `DCGM_FI_DEV_GPU_UTIL` | DCGM Exporter | GPU compute utilization per device |
+| `DCGM_FI_DEV_FB_USED` / `DCGM_FI_DEV_FB_FREE` | DCGM Exporter | VRAM used vs. free — key for KV-cache sizing |
+| `node_provisioning_time_seconds` | Karpenter metrics | Time from scale-out trigger to node ready |
+| `karpenter_pods_startup_duration_seconds` | Karpenter metrics | GPU pod scheduling + container start latency |
+| `spot_interruption_count` | CloudWatch Events | Spot reclaim frequency per instance type |
+
+**vLLM model server metrics (inference-level)**
+
+| Metric | Purpose |
+|---|---|
+| `vllm:num_requests_running` | Active concurrent requests — utilization signal |
+| `vllm:num_requests_waiting` | Queued inside vLLM — backpressure and KEDA trigger |
+| `vllm:gpu_cache_usage_perc` | KV cache hit rate — low hit rate means memory pressure |
+| `vllm:num_preemptions_total` | KV cache evictions — indicates memory saturation |
+| `vllm:prompt_tokens_total` | Cumulative input tokens processed |
+| `vllm:generation_tokens_total` | Cumulative output tokens generated |
+| `vllm:time_to_first_token_seconds` | TTFT per request — latency SLO signal |
+| `vllm:e2e_request_latency_seconds` | Full generation latency per request |
+| `vllm:request_success_total` | Successful completions |
+| `vllm:request_failure_total` | Failed or timed-out requests |
+
+**Derived cost metrics (platform-level)**
+
+The platform computes these from the raw metrics above and exposes them in the same cost ledger used for Bedrock:
+
+```text
+cost_per_gpu_hour     = instance_price_usd / 1
+tokens_per_gpu_hour   = (vllm:generation_tokens_total rate) × 3600
+cost_per_1m_tokens    = cost_per_gpu_hour / (tokens_per_gpu_hour / 1_000_000)
+```
+
+These must be tracked per model route (`managed_default`, `managed_recovery`, `selfhosted_default`) in the same `model_route` field used throughout Stage 4, so cost dashboards can directly compare Bedrock vs. self-hosted at field level without schema changes.
+
+**Grafana dashboards**
+
+Two side-by-side dashboards are required:
+
+1. **Managed inference dashboard** — Bedrock invocation count, token throughput, TTFT, model throttle rate, cost per 1M tokens, cost per job. Source: CloudWatch EMF metrics.
+
+2. **Self-hosted inference dashboard** — GPU utilization, VRAM used, KV cache usage, tokens/sec, TTFT, request queue depth, spot interruptions, node provisioning time, cost per 1M tokens. Source: Prometheus/Grafana.
+
+A unified **cost comparison panel** overlays managed and self-hosted cost per 1M tokens on the same axis, updated in real time, so the operator can see the crossover point as volume changes.
+
+### 14.3 Break-Even Analysis
+
+**Assumptions for this model**
+
+| Parameter | Value | Source |
+|---|---|---|
+| Bedrock Llama 3.1 8B price | `$0.22/1M` tokens (input + output) | Confirmed pricing (see A13) |
+| g5.xlarge on-demand | `$1.006/hr` | AWS EC2 us-east-1 |
+| g5.xlarge 1-year reserved (no upfront) | ~`$0.523/hr` effective | ~48% saving on on-demand |
+| g5.xlarge spot | ~`$0.35/hr` | Approximate; varies with AZ and time |
+| vLLM throughput (Llama 3.1 8B, INT8, A10G) | `825 tokens/sec` at 80% GPU utilization | Target; requires FP8/INT8 quantization |
+| Tokens per doc (4 chunks × 19.2K tokens) | `76,800 tokens/doc` | From A14 |
+| EKS cluster overhead (control plane, NAT, monitoring) | `~$700/month` | Approximate fixed cost |
+| Reserved baseline (2× g5.xlarge) | `~$753/month` | 2 × $0.523 × 720 hrs |
+| Total fixed infrastructure cost | **`~$1,453/month`** | Overhead + reserved |
+
+**Why 825 tokens/sec is the per-token break-even threshold**
+
+At what throughput does the reserved GPU cost equal Bedrock's price per token?
+
+```text
+reserved_cost_per_1M = $0.523/hr ÷ (T × 0.80 × 3600 / 1,000,000)
+
+Set equal to Bedrock:
+$0.523 ÷ (T × 0.80 × 3600 / 1,000,000) = $0.22
+T = $0.523 × 1,000,000 ÷ ($0.22 × 0.80 × 3600)
+T = 523,000 ÷ 633.6 ≈ 825 tokens/sec
+```
+
+At throughput above 825 tokens/sec per reserved A10G, self-hosted is cheaper per token than Bedrock. This requires INT8 or FP8 quantization with vLLM's continuous batching. Without quantization (~500 tokens/sec), even reserved self-hosted costs ~`$0.36/1M` — more expensive than Bedrock.
+
+**Volume break-even: at what daily document rate does self-hosted become net cheaper?**
+
+```text
+Bedrock monthly cost = docs/day × 30 × $0.01690/doc
+Self-hosted monthly cost = $1,453 (fixed) + max(0, GPU_hours_needed − baseline_hours) × $0.35
+GPU_hours_needed = docs/day × 30 × 0.03232 hrs/doc
+Baseline_hours = 2 GPUs × 720 hrs = 1,440 hrs
+```
+
+Setting Bedrock = self-hosted and solving:
+
+```text
+docs/day × 30 × $0.01690 = $1,453 + (docs/day × 30 × 0.03232 − 1,440) × $0.35
+$0.5069 × D = $1,453 + 0.3394 × D − $504
+$0.1675 × D = $949
+D ≈ 5,667 docs/day
+```
+
+**Break-even point: approximately 5,500–6,000 docs/day.**
+
+**Cost comparison table**
+
+| Daily volume | Bedrock/month | Self-hosted/month | Delta | Winner |
+|---|---:|---:|---:|---|
+| 1,000 docs/day | `$507` | `$1,453` (fixed) | `-$946` | Bedrock |
+| 3,000 docs/day | `$1,521` | `$1,453` (baseline covers all) | `+$68` | Break-even zone |
+| 5,667 docs/day | `$2,873` | `$2,764` | `+$109` | Self-hosted (marginal) |
+| 10,000 docs/day | `$5,069` | `$4,343` | `+$726` | Self-hosted (~14% saving) |
+| 20,000 docs/day | `$10,138` | `$7,737` | `+$2,401` | Self-hosted (~24% saving) |
+| 50,000 docs/day | `$25,344` | `$17,919` | `+$7,425` | Self-hosted (~29% saving) |
+
+Self-hosted savings grow non-linearly because the fixed infrastructure cost is amortized over more volume. At 50K docs/day (peak burst capacity), self-hosted saves ~29% despite spot instance variability.
+
+**Key risks and caveats**
+
+- The analysis assumes sustained throughput of 825+ tokens/sec per GPU, which requires vLLM with INT8/FP8 quantization and high GPU utilization. If throughput falls to ~500 tokens/sec (no quantization), break-even volume rises to ~30,000+ docs/day.
+- Spot interruption rates vary. If spot availability degrades and the platform falls back to on-demand ($1.006/hr), the effective self-hosted cost per token rises significantly and the break-even volume jumps to ~20,000+ docs/day.
+- 70B self-hosted economics are harder: at $2.95/hr for g5.12xlarge reserved, the per-token cost at 400 tokens/sec is ~$2.56/1M — far above Bedrock's $0.72/1M. Self-hosted 70B only becomes viable at very high sustained utilization with larger A100-class instances, which the platform is not designed for in v1.
+- The fixed infrastructure cost grows if the platform adds multi-region EKS, more reserved GPU tiers, or dedicated model nodes for tenant isolation.
+
+**Recommendation**
+
+Adopt self-hosted inference for the 8B default model when sustained volume exceeds **10,000 docs/day** and vLLM throughput benchmarks confirm >825 tokens/sec on the A10G with production-representative prompts. Use Bedrock 8B below that threshold and retain Bedrock 70B for recovery regardless of volume. Monitor the cost comparison Grafana panel continuously after any model or infrastructure change.
 
