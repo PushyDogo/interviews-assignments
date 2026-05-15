@@ -47,3 +47,9 @@ Assumptions that directly justify time, cost, and operational metrics. Design de
 | A17 | Stage 5 cost targets: deterministic merge ≤`$0.001/100 pages`; synthesis target ≤`$0.010/100 pages`; hard stop-loss at `$0.025/100 pages`. | The claim that Stage 5 leaves meaningful budget headroom within the `$0.10/100-page` pipeline target. | If synthesis is triggered frequently (e.g., contract-heavy workloads), Stage 5 cost will be at the upper end. Document summaries must be skipped when the hard stop-loss would be breached. |
 | A18 | Synthesis token budget per document: ≤20K target input, 30K hard cap, ≤1.5K target output, 2K hard cap, maximum 10 synthesis questions. | The Stage 5 latency budget (P95 ≤30s) and cost model. | If cross-chunk reasoning regularly requires more than 10 questions or denser synthesis packets, the cap must be raised and the latency and cost targets re-evaluated. |
 | A19 | Document success thresholds: critical field coverage = 100%, required field coverage ≥ 95%, unresolved normal conflicts ≤ 3. These are configurable per schema in v1; tenant-specific overrides are v2. | The merge outcome rules and the partial-success classification accuracy claim. | If thresholds are too strict, manual-inspection rate will be high. If too loose, low-quality outputs reach customers. Production telemetry should drive threshold tuning. |
+
+## Stage 6 — Post-Processing and Final Validation
+
+| # | Assumption | Justifies | Impact if Wrong |
+|---|---|---|---|
+| A20 | Stage 6 cost target: compute ≤`$0.001/100 pages`; total hard stop-loss at `$0.005/100 pages`. Stage 6 has no model inference — cost is Lambda/Fargate compute, S3 reads/writes, and DynamoDB updates. | The claim that Stage 6 leaves the remaining budget headroom for Stage 7 within the `$0.10/100-page` pipeline target. | If the hard stop-loss is regularly exceeded, it indicates retry storms, oversized validation outputs, or policy/configuration bugs — not a normal workload increase. |

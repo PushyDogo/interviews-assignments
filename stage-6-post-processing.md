@@ -151,43 +151,16 @@ Events carry tenant/job IDs, post-processing attempt ID, artifact hashes, schema
 
 Stage 6 uses the same tenant schema registry introduced in Stage 4 and extended in Stage 5. The post-processing policy is a section of the schema document alongside extraction and merge rules, versioned together unless explicitly pinned by `post_processing_policy_version`.
 
-Recommended policy shape:
+Each field entry declares type, normalization rule, criticality, validators, and redaction policy. For example:
 
 ```json
 {
-  "post_processing_policy_version": "2026-05-15.v1",
-  "locale": "en-US",
-  "timezone": "UTC",
-  "default_currency": "USD",
-  "field_rules": {
-    "invoice_date": {
-      "type": "date",
-      "normalization": "iso_date",
-      "required": true,
-      "criticality": "critical"
-    },
-    "total_amount": {
-      "type": "currency_amount",
-      "normalization": "decimal_currency",
-      "required": true,
-      "criticality": "critical",
-      "validators": ["invoice_total_reconciliation"]
-    },
-    "vendor_tax_id": {
-      "type": "identifier",
-      "normalization": "tax_id_format_preserving",
-      "required": false,
-      "criticality": "normal",
-      "redaction_policy": "mask_except_last_4"
-    }
-  },
-  "output_policy": {
-    "include_citations": true,
-    "include_confidence": true,
-    "include_validation_summary": true,
-    "validation_report_access": "operator_support_only",
-    "redacted_output_enabled": true,
-    "suppress_fields": []
+  "total_amount": {
+    "type": "currency_amount",
+    "normalization": "decimal_currency",
+    "required": true,
+    "criticality": "critical",
+    "validators": ["invoice_total_reconciliation"]
   }
 }
 ```
@@ -198,21 +171,7 @@ Schema, merge, and post-processing policies should be compatible. CI should fail
 
 Stage 6 stores both canonical values and raw values when useful. Canonical values are for customer workflows; raw values preserve what the source said.
 
-Recommended normalization rules:
-
-| Field type | Canonical form | Notes |
-|---|---|---|
-| Date | ISO-8601 date or datetime | Use tenant timezone only when source lacks timezone and policy allows inference |
-| Currency | ISO-4217 currency code plus decimal string | Never use binary floating point for money |
-| Amount | Decimal string with scale | Preserve raw symbol and separators in `raw_value` |
-| Percentage/tax rate | Decimal ratio or percentage string per schema | Keep jurisdiction/source citation |
-| Address | Structured lines plus raw text | Avoid aggressive geocoding in v1 |
-| Person/company name | Trimmed display string plus normalized comparison key | Preserve original casing for display |
-| Identifier | Format-preserving normalized string | Do not strip meaningful check digits |
-| Boolean/checkbox | `true`, `false`, or `unknown` | `unknown` when source is ambiguous |
-| Table/line item | Ordered array with row IDs and citations | Preserve source order unless schema says to sort |
-
-Ambiguous normalization must not guess. If a date could be `MM/DD/YYYY` or `DD/MM/YYYY` and the tenant locale/schema does not disambiguate it, keep `raw_value`, set canonical value to `null`, and mark the field `NEEDS_REVIEW` if critical.
+All normalized fields carry both a `value` (canonical form) and a `raw_value` (what the source said). Canonical forms follow standard conventions: ISO-8601 dates, ISO-4217 currency codes with decimal strings, format-preserving identifiers, and ordered arrays with row IDs for tables. Ambiguous values must not be guessed — if locale or schema cannot disambiguate, keep `raw_value`, set `value` to `null`, and mark the field `NEEDS_REVIEW` if critical.
 
 ### 5.4 Deterministic Validators
 
@@ -259,17 +218,7 @@ Recommended formula inputs:
 - Validator outcomes.
 - Manual review approval, if present.
 
-Default v1 confidence policy:
-
-| Condition | Final field confidence |
-|---|---|
-| Manual reviewer approves/corrects field | `1.0` with `confidence_source="manual_review"` |
-| Field passes citation and all required validators | Minimum of upstream field, merge, and cited OCR confidence |
-| Field passes with non-critical warning | Upstream minimum minus configured penalty, default `0.05` |
-| Field has invalid/missing citation | Field rejected as `not_found` |
-| Critical field fails validation | Manual inspection or reprocess; not delivered as valid |
-
-The final artifact should expose `confidence`, `confidence_source`, and validator outcomes when the tenant output policy allows them.
+Final confidence is derived from upstream evidence: minimum of Stage 4 field confidence, Stage 5 merge confidence, and cited OCR confidence, adjusted down for non-critical warnings. Manual reviewer approval overrides to `1.0` with `confidence_source="manual_review"`. Invalid or missing citations cause the field to be rejected as `not_found` — Stage 6 does not invent confidence. The final artifact exposes `confidence`, `confidence_source`, and validator outcomes when output policy allows them.
 
 ### 5.6 Manual Review and Reprocessing Gate
 
@@ -340,17 +289,7 @@ Recommended ledger fields:
 - `billing_reason`
 - `replay_initiator`
 
-Approximate v1 cost policy:
-
-| Cost item | Target |
-|---|---:|
-| Post-processing compute | `<= $0.001 / 100 pages` |
-| Final artifact write/read requests | `<= $0.0005 / 100 pages` |
-| Redaction policy overhead | `<= $0.0005 / 100 pages` |
-| Stage 6 soft stop-loss | `> $0.003 / 100 pages` |
-| Stage 6 hard stop-loss | `> $0.005 / 100 pages` |
-
-If Stage 6 cost exceeds the hard stop-loss, that usually indicates retry storms, oversized outputs, or policy/configuration bugs. Route to operator review rather than continuing blindly.
+Stage 6 is compute-only — no model inference. Total cost should be well under `$0.005/100 pages`. If the hard stop-loss is breached, it indicates retry storms, oversized outputs, or configuration bugs — route to operator review rather than continuing.
 
 ## 6. Latency Budget
 
@@ -430,33 +369,7 @@ Recommended `final-result.json` shape:
 
 `customer-result.json` has the same shape only for fields allowed by output policy. In v1, the redaction engine is enabled by default, so this artifact contains masked/suppressed values where a field policy requires it and an `output_redaction_applied=true` marker when any value changes. Fields without an explicit redaction or suppression rule flow through unchanged.
 
-Recommended redacted field shape:
-
-```json
-{
-  "vendor_tax_id": {
-    "value": "*****6789",
-    "raw_value": null,
-    "display_value": "*****6789",
-    "type": "identifier",
-    "confidence": 0.93,
-    "validation_status": "VALID",
-    "redaction": {
-      "applied": true,
-      "policy": "mask_except_last_4",
-      "original_value_available": false
-    },
-    "source_citations": [
-      {
-        "page_number": 1,
-        "citation_id": "cit_001"
-      }
-    ]
-  }
-}
-```
-
-`customer-result.json` should use `value` for the customer-visible value, even when masked. It should not include the unredacted `raw_value`. The full unmasked value remains only in `final-result.json` under stricter access controls.
+`customer-result.json` uses `value` for the customer-visible value even when masked. It should not include the unredacted `raw_value`. The full unmasked value remains only in `final-result.json` under stricter access controls.
 
 `validation-report.json` is operator/support-only in v1. This is the safer default for SOC 2 and GDPR because the report can expose validator internals, field IDs, citation IDs, and operational reason codes that are not necessary for normal customer workflows. Customers receive a sanitized validation summary in `customer-result.json`; full report access can be added later through a governed support/export workflow. The report must not include raw field values unless tenant support policy explicitly allows it and the object is encrypted under the tenant KMS key.
 
@@ -555,6 +468,10 @@ Recommended metrics:
 
 High-cardinality tenant/job IDs stay in structured logs and X-Ray traces, not unconstrained metric dimensions.
 
+### 11.1 Alerts
+
+Alert on: post-processing latency SLO burn, critical validation failure rate spikes, invoice total conflict rate increases, manual-inspection routing spikes, reprocess request rate increases, DLQ depth growth, redaction failure events, KMS access failures, and PII detected in logs.
+
 Useful traces:
 
 - `Stage6.LoadStage5Artifact`
@@ -577,7 +494,6 @@ Required versioning:
 - Normalization library version.
 - Validator library version.
 - Redaction policy version.
-- Evaluation dataset version.
 
 Evaluation requirements:
 
@@ -599,17 +515,3 @@ Canary guardrails:
 - P95 post-processing latency remains within `10s`.
 - Stage 6 cost remains under hard stop-loss.
 
-## 13. Closed Stage 6 Decisions
-
-| Decision | V1 choice | V2 refinement |
-|---|---|---|
-| Stage role | Deterministic final validation, normalization, redaction, and packaging | Tenant-specific workflow plugins after governance |
-| Start condition | Only deliverable Stage 5 states: completed or review-approved | More granular partial delivery policies |
-| Stronger-model recovery | Emit bounded replay request; do not call model directly in Stage 6 | Policy-driven automatic recovery workflows |
-| Invoice total conflicts | Manual inspection; arithmetic evidence only | Auto-resolution only after reviewed-data precision is proven |
-| Redaction | Apply after validation; never deliver unredacted output if redaction fails | Tenant-specific redaction templates |
-| Redaction default | Enabled by default for customer-facing output | Tenant-specific redaction templates and opt-down policies |
-| Validation report access | Operator/support-only in v1; customer gets sanitized validation summary | Governed customer export workflow |
-| Final artifacts | `final-result.json`, `customer-result.json`, and `validation-report.json`; JSON only in v1 | CSV/XLSX or other customer-specific output formats |
-| Stage 6 latency budget | P50 `<= 2s`, P95 `<= 10s`, P99 `<= 20s` | Tune by document type and output size |
-| Stage 6 cost target | `<= $0.001/100 pages` compute target; hard stop-loss `> $0.005/100 pages` | Larger customer-specific validation plugins by tier |
