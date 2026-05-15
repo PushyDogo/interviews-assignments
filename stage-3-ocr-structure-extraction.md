@@ -136,7 +136,7 @@ Default v1 service:
 | Form/key-value extraction | Raw OCR/layout plus Stage 4 schema extraction by default; Textract async `StartDocumentAnalysis` with `FORMS` only for selected pages/regions | Supported in v1, but selective because of cost |
 | Queries/signatures/expense-specific extraction | Textract `StartDocumentAnalysis` or `AnalyzeExpense` | Explicit schema/tenant policy only |
 
-This means Stage 3 supports text, forms, and tables, but the default path remains cost-aware. Per `aws-pricing.md`, Textract `DetectDocumentText` is `$0.0015/page` for the first 1M pages/month, while Forms + Tables can reach `$0.065/page`. A 100-page document with every page sent to Forms + Tables would spend about `$6.50` on Textract alone, far above the `$0.10/100-page` target.
+This means Stage 3 supports text, forms, and tables, but the default path remains cost-aware. At platform volume (>1M pages/month), Textract text and table detection costs `$0.0010/page`, while form (key-value) extraction costs `$0.0040/page`. A 100-page document with every page sent to form extraction would spend `$0.40` on Textract alone, already 4x the `$0.10/100-page` target before LLM, orchestration, or storage costs.
 
 Structured OCR is selected by policy, not by developer guesswork. The policy can choose:
 
@@ -172,22 +172,7 @@ Textract async input mechanics are concrete:
 - Do not rely on "image bundles" as a Textract async input format.
 - Do not send the original 1,000-page PDF to Textract just to process a few OCR pages.
 
-When the worker creates a temporary per-chunk or per-range OCR input artifact, it must record:
-
-```json
-{
-  "ocr_input_uri": "s3://document-ai-intermediate/tenant=tenant_123/jobs/job_01/chunks/chunk_003/ocr-input.pdf",
-  "source_pages": [51, 52, 53, 58],
-  "ocr_input_page_to_source_page": {
-    "1": 51,
-    "2": 52,
-    "3": 53,
-    "4": 58
-  }
-}
-```
-
-Temporary OCR input artifacts are encrypted with the tenant KMS key and follow the same short retention policy as enhanced images unless needed for manual inspection.
+When the worker creates a temporary per-chunk or per-range OCR input artifact, it must record the mapping from OCR-input page positions back to original source page numbers so downstream stages can correctly attribute blocks to the right document pages. Temporary OCR input artifacts are encrypted with the tenant KMS key and follow the same short retention policy as enhanced images unless needed for manual inspection.
 
 Every Textract async call must pass `OutputConfig`:
 
@@ -209,7 +194,7 @@ This keeps Textract raw output under the tenant-scoped S3 prefix and encrypted w
 
 V1 should prefer region-level OCR when Stage 2 provides trustworthy coordinates. This minimizes paid OCR input and reduces duplicate text that later stages must reconcile.
 
-Initial v1 confidence threshold: Stage 3 trusts Stage 2 region coordinates when `region_confidence >= 0.80`. If Stage 2 provides separate signals, require `bbox_confidence >= 0.85` and `content_classification_confidence >= 0.75`. These are starting estimates and should be tuned from labeled production examples.
+V1 starting threshold: trust Stage 2 region coordinates at `region_confidence >= 0.80`. These values should be tuned from labeled production examples.
 
 Recommended policy:
 
@@ -228,39 +213,7 @@ Region-level OCR has a cost guardrail: if region cropping would create more bill
 
 Some document types or tenants require forms, tables, queries, signatures, or expense-specific extraction before Stage 4. This is supported in v1, but it must be controlled by schema and tenant policy rather than ad hoc code paths.
 
-Recommended policy object:
-
-```json
-{
-  "ocr_policy_version": "2026-05-15.v1",
-  "default_api": "TEXTRACT_DETECT_DOCUMENT_TEXT",
-  "structured_ocr_enabled": true,
-  "structured_ocr_apis": ["TABLES", "FORMS"],
-  "structured_page_selectors": ["schema.table_pages", "schema.form_pages", "critical_pages_only"],
-  "max_structured_pages_per_job": 10,
-  "max_queued_or_active_structured_pages_per_tenant": 50,
-  "max_region_crops_per_page": 3,
-  "requires_customer_approval_above_usd": 0.10
-}
-```
-
-Strict cost-controlled policy example:
-
-```json
-{
-  "ocr_policy_version": "2026-05-15.v1",
-  "default_api": "TEXTRACT_DETECT_DOCUMENT_TEXT",
-  "structured_ocr_enabled": false,
-  "structured_ocr_apis": [],
-  "structured_page_selectors": [],
-  "max_structured_pages_per_job": 0,
-  "max_queued_or_active_structured_pages_per_tenant": 50,
-  "max_region_crops_per_page": 0,
-  "requires_customer_approval_above_usd": 0.10
-}
-```
-
-Every structured OCR decision must be written to the usage ledger and audit trail with the reason. If estimated structured OCR cost would exceed the tenant or job ceiling, the chunk is paused for explicit approval or routed to manual inspection based on tenant policy.
+The OCR policy is a versioned, schema-level configuration that declares: which structured APIs are enabled (`TABLES`, `FORMS`, or none), which page selectors activate them (e.g. `schema.table_pages`, `critical_pages_only`), and per-tenant concurrency limits. The default policy enables text-only OCR; structured APIs must be explicitly enabled per schema. Every structured OCR decision is written to the usage ledger and audit trail with the reason. If projected structured OCR cost exceeds the tenant or job ceiling, the chunk is routed to manual inspection — form extraction at `$0.0040/page` makes this ceiling especially important.
 
 Structured page selectors are declarative expressions evaluated against the page manifest at chunk start. V1 can use JSONPath or CEL-style expressions such as `schema.table_pages`, `schema.form_pages`, and `critical_pages_only`; schemas declare these selectors in the schema definition document, versioned alongside `ocr_policy_version`.
 
@@ -294,17 +247,7 @@ Recommended controls:
 
 When capacity is unavailable, Stage 3 should not fail the chunk immediately. It should remain queued, emit queue-age metrics, and let admission control slow new accepted work if backlog threatens the 5-minute P95 target.
 
-Recommended v1 starting limits:
-
-| Limit | Initial value | Why |
-|---|---:|---|
-| Global active OCR units | `100` | Conservative launch default until AWS service quotas and observed callback latency are validated |
-| Base tenant active OCR units | `5` | Prevents one tenant from dominating shared OCR capacity |
-| Per-job active OCR chunks | `2` | Keeps one 1,000-page job from starving many small jobs |
-| Structured OCR active units per tenant | `1` | Structured OCR is expensive and should be tightly shaped |
-| Queued-or-active structured OCR pages per tenant | `50` | Applies backpressure before one tenant builds a large structured OCR backlog |
-
-V1 has only base-level tenants, so there is no standard/enterprise split in these limits. These numbers are not hard product limits. They are safe v1 defaults. Before launch, run a load test against approved Textract service quotas, callback throughput, DynamoDB write capacity, and Step Functions concurrency. Increase global and tenant limits only when queue-age, cost, and error-rate metrics remain healthy. Tier-based OCR concurrency is a v2 concern.
+V1 starting defaults: 100 global active OCR units, 5 per tenant, 2 per job, 50 queued-or-active structured OCR pages per tenant. These are conservative launch values and must be validated by load test before release. Tier-based limits are a v2 concern.
 
 ## 7. Stage 3 Latency Budget
 
@@ -467,18 +410,7 @@ Recommended default handling:
 
 Criticality comes from the schema and Stage 2 manifest. For example, signature pages, invoice totals, contract clauses, and required form pages may be critical even if they are only a small fraction of the chunk.
 
-Textract returns confidence values on a `0-100` scale. The normalized Stage 3 artifact stores confidence on a `0.0-1.0` scale. Thresholds below use the normalized scale.
-
-Default v1 confidence thresholds:
-
-| Signal | Critical content threshold | Non-critical content threshold | Action |
-|---|---:|---:|---|
-| Required field block confidence | `< 0.90` | `< 0.75` | Mark low confidence; critical fields enter escalation |
-| Page average OCR confidence | `< 0.85` | `< 0.70` | Mark page warning; critical pages enter escalation |
-| Low-confidence block fraction | `> 5%` of blocks below `0.90` | `> 15%` of blocks below `0.75` | Mark page/chunk degraded |
-| Table/form structural confidence | `< 0.85` | `< 0.70` | Prefer stronger structured extraction or manual inspection |
-
-These defaults are schema-configurable in v1. For example, invoice totals, signatures, and required legal clauses can use stricter thresholds than non-critical boilerplate. Tenant-specific threshold overrides are deferred to v2 because v1 has only base-level tenants.
+Textract returns confidence on a `0-100` scale; the Stage 3 artifact normalizes to `0.0-1.0`. V1 defaults: critical field blocks `< 0.90` and page averages `< 0.85` enter the escalation ladder; non-critical content at `< 0.75` is marked degraded and continues. These thresholds are schema-configurable and should be tuned from production data.
 
 Critical-page escalation ladder:
 
@@ -530,26 +462,28 @@ Cost ledger fields:
 - `billing_reason`
 - `replay_initiator`
 
-Default raw OCR cost formula:
+Default cost formulas at platform volume (>1M pages/month):
 
 ```text
-raw_ocr_cost = raw_ocr_pages * 0.0015
+text_ocr_cost  = text_ocr_pages  * $0.0010
+table_ocr_cost = table_ocr_pages * $0.0010
+form_ocr_cost  = form_ocr_pages  * $0.0040
 ```
 
-For example, if a 25-page chunk has 13 raw OCR pages:
+For example, a 25-page chunk with 13 raw text/table OCR pages and 2 form pages:
 
 ```text
-13 * $0.0015 = $0.0195
+(13 * $0.0010) + (2 * $0.0040) = $0.0130 + $0.0080 = $0.0210
 ```
 
-This cost is acceptable only when OCR is limited to pages that need it. The unit-economics policy above is the reason Stage 2 routing and Stage 3 stop-loss controls are required.
+Form extraction is 4x the cost of text/table OCR. Even a small number of form pages has an outsized cost impact, which is why form extraction must be schema-gated and not applied by default. These costs are acceptable only when OCR is limited to pages that need it.
 
 Stop-loss behavior:
 
 - Estimate Stage 3 cost before starting OCR.
 - If projected job cost exceeds tenant policy, pause for approval, downgrade to raw text extraction where safe, or route to manual inspection.
 - Never silently switch into structured OCR or a stronger model.
-- Mark platform-initiated replays as non-billable according to DDR-038.
+- Mark platform-initiated replays as non-billable in the usage ledger.
 
 ## 12. Reliability and Replay
 
@@ -689,6 +623,10 @@ Recommended metrics:
 
 High-cardinality values such as tenant ID and job ID should stay in structured logs and traces, not as unconstrained CloudWatch metric dimensions.
 
+### 14.1 Alerts
+
+Alert on: OCR error rate spikes, queue age breaching the Stage 3 latency budget, DLQ depth growth, Textract throttle count spikes, structured OCR cost spikes (form pages), circuit breaker open events, callback timeout spikes, KMS access failures, and PII detected in logs.
+
 Traces must propagate:
 
 - `correlation_id`
@@ -699,12 +637,3 @@ Traces must propagate:
 - Step Functions execution ARN
 - Textract job ID
 
-## 15. Closed Stage 3 Decisions
-
-The previous open Stage 3 decisions are now closed for v1:
-
-| Decision | V1 choice | V2 refinement |
-|---|---|---|
-| Structured OCR page/region limit | Fixed `50` queued-or-active structured OCR pages per base tenant before backpressure/`429` | Tenant-tier-specific limits |
-| Region-coordinate confidence | Trust Stage 2 regions at `region_confidence >= 0.80`, with `bbox_confidence >= 0.85` and `content_classification_confidence >= 0.75` when separate signals exist | Tune thresholds from labeled examples |
-| Stronger-model escalation | Default on for all base tenants in the critical-page escalation ladder | Make recovery policy tenant-configurable |
