@@ -145,7 +145,7 @@ Prompt and schema registry:
 
 Few-shot retrieval is enabled in v1 because extraction quality matters and schemas can vary materially by customer workflow.
 
-Few-shot architecture: use Bedrock Knowledge Bases over OpenSearch Serverless with Titan Embeddings V2, cosine similarity, `top_k=3`, and mandatory metadata filters for `tenant_id`, `schema_id`, `document_type`, `prompt_major_version`, and `pii_safe=true`.
+Few-shot retrieval uses Bedrock Knowledge Bases with mandatory metadata filters for `tenant_id`, `schema_id`, `document_type`, `prompt_major_version`, and `pii_safe=true` to prevent cross-tenant example leakage.
 
 Few-shot retrieval rules:
 
@@ -189,15 +189,7 @@ Llama 3.1 Instruct has a 128K token context window and a 2K max output limit on 
 
 Stage 4 uses a hard chunk-level prompt cap of `30K` input tokens even though the model supports 128K. The larger model context is treated as headroom for recovery, dense tables, and future synthesis, not as permission to pass full documents.
 
-Recommended context budget inside the 128K window:
-
-| Reservation | Budget | Purpose |
-|---|---:|---|
-| System instructions and schema | `8K` | Stable extraction rules and JSON contract |
-| Few-shot examples | `4K` | Schema-matched examples |
-| Chunk OCR/content blocks | `<= 30K` hard cap | Source text/layout for one chunk |
-| Output allowance | `2K` | Schema-valid JSON |
-| Safety margin | `8K+` | Tokenizer variance, citations, tables, repair prompts |
+The 30K hard cap uses only a fraction of the 128K window; the remaining space is reserved for system instructions (~8K), few-shot examples (~4K), output (~2K), and a safety margin for tokenizer variance, citations, and repair prompts.
 
 Overflow handling:
 
@@ -217,20 +209,11 @@ V1 managed path:
 
 | Route | Model | Use |
 |---|---|---|
-| Default extraction | Bedrock Llama 3.1 8B Instruct | Cost-controlled text-only structured extraction and easiest self-hosting substitute |
-| Stronger recovery | Bedrock Llama 3.1 70B Instruct | Critical low-confidence recovery path |
-| Self-hosted | EKS vLLM/TGI serving the same Llama 3.1 Instruct family | V2/high-volume option after quality and break-even validation |
+| Default extraction | Bedrock Llama 3.1 8B Instruct | `$0.22/1M` tokens — cost-controlled default; same family as self-hosted path |
+| Stronger recovery | Bedrock Llama 3.1 70B Instruct | `$0.72/1M` tokens — critical-field recovery only |
+| Self-hosted | EKS vLLM/TGI serving the same Llama 3.1 Instruct family | V2/high-volume option after break-even validation |
 
-The default managed model should be Llama 3.1 8B Instruct on Bedrock. We avoid `meta.llama3-2-11b-instruct-v1:0` because it is a vision/multimodal model, not the text-only default we want for extraction. Llama 3.1 8B gives us a managed v1 path while keeping a cleaner migration path to self-hosted inference later, because the same model family can be served through vLLM or TGI on EKS.
-
-Recommended v1 routing:
-
-- Default: `meta.llama3-1-8b-instruct-v1:0` on Bedrock, assuming evaluation confirms field-level quality is acceptable.
-- Recovery: `meta.llama3-1-70b-instruct-v1:0` on Bedrock for critical-field failures, low-confidence extraction, or schema repair failures.
-- Batch: Llama 3.1 8B batch processing for non-latency-sensitive replays, backfills, and offline evaluation where half-price batch economics matter more than interactive latency.
-- Self-hosted v2: the same Llama 3.1 model family served on EKS after quality, latency, and cost-per-token break-even validation.
-
-`aws-pricing.md` now carries the us-east-1 Llama 3.1 8B rate for default extraction. The 70B recovery rate remains a planning estimate until verified in the same account/region.
+Llama 3.1 8B is the default because it shares the same model family as the self-hosted path, keeping the migration to EKS clean. Batch processing mode (half-price) is reserved for offline replays and evaluation, not the interactive SLA path.
 
 Model routing policy:
 
@@ -302,17 +285,7 @@ If queue age plus projected model latency exceeds the Stage 4 P95 budget, Stage 
 
 These budgets are not meant to be added naively across stages. The pipeline fans out chunks in parallel: Stage 3 OCR, Stage 4 extraction, and later merge work overlap across chunks as upstream chunks complete. The end-to-end P95 budget is defended by critical-path latency, queue age, and the slowest required chunk, not by summing every stage's P95. Stage budget alarms still matter because a sustained Stage 4 queue can become the critical path for large documents.
 
-Recommended v1 Bedrock concurrency controls:
-
-| Limit | Initial value | Why |
-|---|---:|---|
-| Global active Bedrock extraction calls | `100` | Conservative default until per-model quotas are raised and tested |
-| Base tenant active Bedrock calls | `5` | Prevents one tenant from consuming shared model quota |
-| Per-job active extraction chunks | `5` | Lets a 1,000-page / ~20-chunk job finish Stage 4 in about `ceil(20/5) * chunk_latency`, while not starving smaller jobs |
-| Stronger recovery active calls per tenant | `1` | Keeps 70B recovery from consuming the default path |
-| Batch jobs per tenant | `1` | Batch is for offline/replay work, not interactive SLA path |
-
-Launch readiness must include Bedrock quota requests for the selected Llama 3.1 models. If a new account starts at roughly 100-200 requests/minute for a model, the production request rate needed for 50,000-document bursts must be requested, load-tested, and tied to admission control before launch.
+V1 starting defaults: 100 global active Bedrock calls, 5 per tenant, 5 per job, 1 stronger-recovery call per tenant. These are conservative launch values. Bedrock quota increase requests for Llama 3.1 8B and 70B must be submitted and load-tested before launch; a new account typically starts at 100–200 RPM per model.
 
 ## 7. Output Artifact Contract
 
@@ -376,15 +349,14 @@ The artifact may contain PII and must be encrypted with the tenant KMS key. Logs
 
 Stage 4 is one of the largest variable-cost drivers after OCR.
 
-Default managed cost formula:
+Default managed cost formula (Llama 3.1 8B at `$0.22/1M` tokens input and output):
 
 ```text
-input_cost = input_tokens / 1_000_000 * model_input_price_per_1m
-output_cost = output_tokens / 1_000_000 * model_output_price_per_1m
-few_shot_embedding_cost = retrieval_tokens / 1_000_000 * embedding_price_per_1m
+chunk_cost = (input_tokens + output_tokens) / 1_000_000 * $0.22
 ```
 
-`aws-pricing.md` uses the us-east-1 Llama 3.1 8B rate for Stage 4 default extraction. The previous pricing model used Claude Haiku 4.5 and then Llama 3.2 11B rates, so Stage 4 should not cite those prices after this model-routing decision.
+For a typical chunk with 18K input + 1.2K output tokens: `19,200 / 1,000,000 * $0.22 = ~$0.0042`.
+Recovery with Llama 3.1 70B at `$0.72/1M`: same chunk costs ~`$0.0138` — 3.3× more expensive, confirming it must be used selectively.
 
 Recommended v1 stop-loss:
 
@@ -406,7 +378,7 @@ Cost controls:
 - Keep schema prompts compact and versioned.
 - Use stronger models only for critical recovery, not broad default extraction.
 - Do not bill tenants for stronger-model recovery in v1; treat it as platform quality recovery. In v2, make stronger-model recovery customer opt-in and billable by tier/policy.
-- Mark platform-initiated replays as non-billable according to DDR-038.
+- Mark platform-initiated replays as non-billable in the usage ledger.
 
 Cost ledger fields:
 
@@ -545,6 +517,10 @@ Recommended metrics:
 
 High-cardinality tenant/job/chunk IDs should remain in structured logs and traces, not unconstrained metric dimensions.
 
+### 12.1 Alerts
+
+Alert on: model throttle rate spikes, Stage 4 queue age breaching the latency budget, DLQ depth growth, schema validation failure rate spikes, cost-per-chunk exceeding stop-loss thresholds, circuit breaker open events, manual-inspection rate increases, TTFT degradation, and PII detected in logs.
+
 ## 13. MLOps and Evaluation
 
 Stage 4 must be evaluated like model behavior, not only like application code.
@@ -561,20 +537,8 @@ Required versioning:
 Evaluation requirements:
 
 - Track precision, recall, and F1 at document, field, and critical-field level.
-- Maintain golden datasets for invoices, contracts, forms, and reports.
 - Track quality by document type, schema, page quality, OCR route, and model version.
-- Compare managed Bedrock and self-hosted model quality before routing production traffic.
 - Use 10% canary rollouts over a 1-hour soak for prompt, schema, model, and extraction-policy changes.
-
-V1 model bake-off list:
-
-| Candidate | Role |
-|---|---|
-| Llama 3.1 8B Instruct | Default low-cost text extraction candidate |
-| Llama 3.1 70B Instruct | Stronger managed recovery candidate |
-| Mistral 7B Instruct | Alternate small-model fallback candidate |
-
-The bake-off must compare field-level F1, critical-field F1, schema validation success, citation validity, latency, cost per 100 pages, and manual-inspection rate. Llama 3.1 8B remains the default only if it passes the launch quality threshold on the golden datasets.
 
 Canary guardrails:
 
@@ -603,14 +567,3 @@ Use self-hosted inference only after:
 - Tenant isolation, data residency, and security controls are validated.
 - Rollback to managed Bedrock is tested.
 
-## 15. Closed Stage 4 Decisions
-
-| Decision | V1 choice | V2 refinement |
-|---|---|---|
-| Default model | Bedrock Llama 3.1 8B Instruct, pending evaluation | Tune model size per schema and tenant tier |
-| Stronger recovery model | Bedrock Llama 3.1 70B Instruct for critical recovery | Make recovery model/tier customer-configurable |
-| Batch mode | Llama 3.1 8B batch processing only for offline replay/backfill/evaluation, not the interactive SLA path | Expand when customer workflows support async completion |
-| Stage 4 latency budget | P50 `<= 20s`, P95 `<= 60s`, P99 `<= 90s` | Tune from production latency by schema/model |
-| Few-shot retrieval | Enabled in v1 with schema-matched examples capped at `3` examples and `4K` tokens | Tenant-specific retrieval policies |
-| Model cost stop-loss | Target `<= $0.025/100 pages`, soft stop-loss `> $0.035/100 pages`, hard stop-loss `> $0.050/100 pages` | Tier-specific budgets |
-| Stronger-model recovery billing | Not billable to tenant in v1; treated as platform quality recovery | Customer opt-in and billable by tier/policy |
