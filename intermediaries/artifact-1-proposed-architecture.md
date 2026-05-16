@@ -265,24 +265,22 @@ Retrieval always returns a short-lived signed URL, never an inline result body. 
 
 ## 7. Self-Hosted LLM Option
 
-Version 1 uses Bedrock managed inference. This section describes the self-hosted path and the quantitative analysis that drives the decision to switch.
-
 ### 7.1 Infrastructure Design
 
 The platform uses three GPU node tiers managed by Karpenter:
 
 | Tier | Instance | Effective rate | Role |
 |---|---|---:|---|
-| Reserved baseline | `g5.xlarge`, 1-year reserved | ~$0.523/hr | Sustained demand, right-sized to high effective utilization |
-| Spot burst | `g5.xlarge` spot | ~$0.624/hr | Elastic surge when reserved is saturated — cheaper than on-demand but no longer a cost-saving tier |
+| Reserved baseline | `g5.xlarge`, 1-year reserved | ~$0.634/hr | Sustained demand, right-sized to high effective utilization |
+| Spot burst | `g5.xlarge` spot | Market price | Elastic surge when reserved capacity is saturated; not assumed cheaper until measured |
 | On-demand overflow | `g5.xlarge` | ~$1.006/hr | Last resort when spot is unavailable or interrupted |
 
 
-Karpenter manages node provisioning with a GPU node pool capped at a configured ceiling as a cost guardrail. Nodes that have been empty for 5 minutes are drained automatically. Reserved capacity should be **right-sized to sustained P95 demand**, so that spot and on-demand only fire during genuine transient bursts — not as the primary path for growth.
+Karpenter manages node provisioning with a GPU node pool capped at a configured ceiling as a cost guardrail. Nodes that have been empty for 5 minutes are drained automatically.
+KEDA scales the vLLM deployment from two signals: the SQS extraction queue depth (one message = one chunk awaiting model inference) and the vLLM internal `num_requests_waiting` metric from Prometheus (requests queued inside the model server's KV-cache scheduler)
 
-KEDA scales the vLLM deployment from two signals: the SQS extraction queue depth (one message = one chunk awaiting model inference) and the vLLM internal `num_requests_waiting` metric from Prometheus (requests queued inside the model server's KV-cache scheduler). Minimum replicas: 1 (keeps one pod warm). Scale-down cooldown: 5 minutes.
-
-vLLM serves Llama 3.1 8B with **INT8 or FP8 quantization**. Without quantization, the A10G achieves only ~500 tokens/sec, at about ~$0.36/1M tokens, more expensive than Bedrock at any tier. Quantization brings effective throughput to ≥825 tokens/sec, the level at which 1-year reserved per-token cost matches Bedrock at 80% utilization.
+vLLM serves the default 8B model in **FP16** for parity with the managed model path.
+The self-hosted cluster must also preserve the same model contract as Bedrock: schema-constrained output, citation grounding, PII controls, prompt-injection defenses, model-version tracking, and canary/rollback support.
 
 ### 7.2 Observability
 
@@ -293,45 +291,92 @@ Self-hosted metrics are collected by Prometheus and visualized in Grafana. They 
 | Metric | Source | Purpose |
 |---|---|---|
 | `DCGM_FI_DEV_GPU_UTIL` | DCGM Exporter | GPU compute utilization per device |
-| `DCGM_FI_DEV_FB_USED/FREE` | DCGM Exporter | VRAM used vs free — KV-cache sizing signal |
+| `DCGM_FI_DEV_FB_USED/FREE` | DCGM Exporter | VRAM used vs free |
 | `node_provisioning_time_seconds` | Karpenter | Time from scale trigger to node ready |
-| `spot_interruption_count` | CloudWatch Events | Spot reclaim rate per instance type — drives fallback to on-demand |
+| `spot_interruption_count` | CloudWatch Events | Spot reclaim rate per instance type |
+| `gpu_node_hours` | Kubernetes / AWS CUR | Billed GPU-hours by reserved, spot, and on-demand tier |
 
 **vLLM inference metrics:**
 
 | Metric | Purpose |
 |---|---|
-| `vllm:num_requests_running` | Active concurrent requests — utilization |
-| `vllm:num_requests_waiting` | Internal queue depth — KEDA trigger |
-| `vllm:gpu_cache_usage_perc` | KV cache hit rate — memory pressure signal |
-| `vllm:time_to_first_token_seconds` | TTFT — latency SLO |
-| `vllm:prompt_tokens_total` / `vllm:generation_tokens_total` | Token throughput — cost basis |
+| `vllm:num_requests_running` | Active concurrent requests |
+| `vllm:num_requests_waiting` | Internal queue depth |
+| `vllm:gpu_cache_usage_perc` | KV cache hit rate|
+| `vllm:time_to_first_token_seconds` | TTFT |
+| `vllm:prompt_tokens_total` / `vllm:generation_tokens_total` | Token throughput  |
+| `stage4_extraction_success_rate` | Confirms self-hosted output quality does not regress versus Bedrock |
+| `schema_validation_failure_rate` | Detects output-contract regressions |
+| `citation_validation_failure_rate` | Detects grounding regressions and hallucination risk |
 
 
 ### 7.3 Break-Even Analysis
 
-**Per-token threshold**
 
-At what GPU throughput does 1-year reserved per-token cost equal Bedrock's $0.22/1M?
+Let:
 
 ```
-$0.523/hr ÷ (T × 0.80 × 3600 / 1,000,000) = $0.22
-T = 523,000 ÷ (0.22 × 0.80 × 3600) ≈ 825 tokens/sec
+P_b = Bedrock price per 1M tokens for the default 8B path
+H_g = hourly cost for one GPU node
+E = effective sustained billed throughput in tokens/sec
 ```
 
-Above 825 tok/s at 80% utilization on 1-year reserved, self-hosted is cheaper per token. Below it, even reserved loses to Bedrock.
+Effective throughput `E` is real utilization. If a GPU can process `T` tokens/sec under benchmark load but is only usefully busy `U` of the time, then:
+
+```
+E = T × U
+```
+
+Self-hosted cost per 1M tokens is:
+
+```
+cost_per_1M = H_g / (E × 3600 / 1,000,000)
+```
+
+Self-hosted beats Bedrock only when:
+
+```
+H_g / (E × 3600 / 1,000,000) < P_b
+```
+
+Rearranged:
+
+```
+E > H_g × 1,000,000 / (P_b × 3600)
+```
+
+Using the current planning inputs:
+
+```
+H_g = $0.634/hr for 1-year reserved g5.xlarge
+P_b = $0.22 / 1M tokens for Bedrock Llama 3.1 8B
+
+E > 0.634 × 1,000,000 / (0.22 × 3600)
+E > ~801 effective tokens/sec
+```
+
+It is the **minimum measured effective throughput** required for one reserved `g5.xlarge` to match Bedrock's token price before adding EKS control-plane, observability, engineering, and operational overhead.
+
+If the target operating utilization is 80%, the measured raw serving throughput must be higher:
+
+```
+T > 801 / 0.80
+T > ~1,001 tokens/sec
+```
+
+If observed throughput or utilization falls below that line, Bedrock remains cheaper on pure token economics.
 
 ---
 
-## 9. Pricing and Latency Summary
+## 8. Pricing and Latency Summary
 
 This section consolidates the per-stage latency and cost budgets that the architecture enforces, with the assumption that grounds each number. All cost figures are for a **representative document mix** (60% digital-text, 30% hybrid, 10% scanned per A5) at the **per-100-pages** unit; ingestion is also shown per-document because it scales with file size, not page count.
 
-### 9.1 Per-Stage Latency and Cost
+### 8.1 Per-Stage Latency and Cost
 
-| Stage | Latency budget | Cost / 100 pages | Primary cost drivers | Anchoring assumptions |
+| Stage | Latency budget | Cost / 100 pages | Primary cost drivers | Assumptions |
 |---|---:|---:|---|---|
-| Ingestion & acceptance | Excluded from SLA clock | ~0.005 typical · ~$0.04 worst-case (per **document**, not per 100 pages) | S3 Transfer Acceleration ($0.04/GB) + GuardDuty Malware Protection ($0.09/GB + $0.215/1K objects) | A2 (clock starts at `accepted_at`); A6 (presigned POST, no Lambda in data path); A8 ($0.04 is the 300 MB ceiling) |
+| Ingestion & acceptance | Excluded from SLA clock | ~0.005 typical · ~$0.04 worst-case (per **document**, not per 100 pages) | S3 Transfer Acceleration (0.04/GB) + GuardDuty Malware Protection (0.09/GB + $0.215/1K objects) | A2 (clock starts at `accepted_at`); A6 (presigned POST, no Lambda in data path); A8 ($0.04 is the 300 MB ceiling) |
 | Pre-processing | ≤ 30 s typical | < $0.001 | Lambda metadata path (≤ 250 pp / ≤ 100 MB) or Fargate vCPU-seconds for image enhancement | A9 (compute path split); deterministic page classifier, no model calls |
 | OCR & structure | P95 ≤ 180 s | 0.010 – $0.040 | Async Textract `DetectDocumentText` at $0.0010/page (volume tier) | A5 (60/30/10 mix); A11 (volume tier above 1 M pages/month). Structured OCR (Forms/Tables) is schema-gated |
 | AI extraction | P95 ≤ 60 s | 0.013 – $0.017 | Bedrock Llama 3.1 8B tokens at $0.22/1M (input + output) | A14 (8B rate); A15 (4 chunks × ~19.2K tokens for ~100 pages); A16 (token budget per chunk). Assumes ≤ 5% chunk-level 70B recovery rate |
@@ -339,17 +384,16 @@ This section consolidates the per-stage latency and cost budgets that the archit
 | Post-processing | P95 ≤ 10 s | < $0.001 | Lambda compute for schema validation, normalization, redaction | A19 (deterministic only, no model inference). Hard stop-loss at $0.005 signals retry storm or config bug |
 | Storage & delivery | P95 ≤ 10 s | ~$0.002 | S3 PUT (3 output artifacts) + DynamoDB terminal update + webhook delivery | A20 (storage + delivery split); A21 (8-attempt webhook retry); A22 (15-min signed URL). 365-day retained-storage is tracked separately from per-job processing cost |
 
-### 9.2 Latency composition
+### 8.2 Latency composition
 
 The per-stage P95 budgets sum to `30 + 180 + 60 + 30 + 10 + 10 = 320 s` -> over the 300 s SLA at face value. This is intentional headroom: P95 latencies do not add linearly. A document does not hit the 95th percentile on every stage simultaneously, so end-to-end P95 is closer to median.
 
 Per-stage budgets also act as **backpressure tripwires**: when queue age in any stage threatens its budget, admission control returns `429 Retry-After` for new work *before* the end-to-end SLA is at risk.
 
-### 9.3 Cost composition
+### 8.3 Cost composition
 
 The 0.036 – 0.061 per-100-pages range assumes the representative mix in A5 and leaves $0.04 – $0.06 of headroom against the $0.10 target. The headroom left can then take:
 
 - 70B recovery on a fraction of chunks (each 8B → 70B chunk swap adds ~$0.014 at the A14 rate)
 - Textract volume tier not applying (+ 50% on OCR, ~ +$0.010)
 - Denser-than-typical content (higher tokens per chunk than A15's 19.2 K)
-- Bounded retry storms after transient failures
